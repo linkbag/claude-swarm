@@ -1,0 +1,24 @@
+# Claude Swarm Configuration
+# Copy to swarm.conf and customize
+
+# Webhook URL for notifications (Slack, Discord, or custom)
+# SWARM_WEBHOOK_URL="https://hooks.slack.com/services/xxx/yyy/zzz"
+
+# Telegram bot notification (alternative)
+# SWARM_TELEGRAM_BOT_TOKEN="123456:ABC-DEF"
+# SWARM_TELEGRAM_CHAT_ID="-1001234567890"
+
+# Default notification channel (webhook|telegram|none)
+SWARM_NOTIFY="none"
+
+# Maximum concurrent agents (default: 8)
+SWARM_MAX_CONCURRENT=8
+
+# Endorsement cooldown seconds (default: 30)
+SWARM_ENDORSEMENT_COOLDOWN=30
+
+# Review max rounds before escalating (default: 3)
+SWARM_MAX_REVIEW_ROUNDS=3
+
+# Auto-merge after integration passes (true|false)
+SWARM_AUTO_MERGE=true
