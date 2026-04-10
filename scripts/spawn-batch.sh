@@ -42,6 +42,32 @@ bash "$SCRIPTS_DIR/notify.sh" --milestone plan \
 REQUIRE_APPROVAL="${SWARM_REQUIRE_APPROVAL:-true}"
 PENDING_DIR="$SWARM_DIR/state/pending/$BATCH_ID"
 
+# Defense in depth: refuse to honor SWARM_REQUIRE_APPROVAL=false if our parent
+# (or grandparent) is a `claude` process. The legitimate /swarm approve path is
+# bot Python → bash → spawn-batch, which has no claude in the parent chain.
+# A claude --print subprocess running with bypassPermissions can set the env
+# var, but this check catches it. The 2026-04-10 tetris incident is the reason.
+if [ "$REQUIRE_APPROVAL" = "false" ]; then
+  PARENT_COMM=""
+  GPARENT_COMM=""
+  if [ -r "/proc/$PPID/comm" ]; then
+    PARENT_COMM=$(cat "/proc/$PPID/comm" 2>/dev/null || echo "")
+    GPID=$(awk '{print $4}' "/proc/$PPID/stat" 2>/dev/null || echo "")
+    if [ -n "$GPID" ] && [ -r "/proc/$GPID/comm" ]; then
+      GPARENT_COMM=$(cat "/proc/$GPID/comm" 2>/dev/null || echo "")
+    fi
+  fi
+  if echo "$PARENT_COMM $GPARENT_COMM" | grep -qiE "(^|[[:space:]])claude($|[[:space:]])"; then
+    echo "⛔ spawn-batch: refusing SWARM_REQUIRE_APPROVAL=false from claude process tree" >&2
+    echo "   parent: $PARENT_COMM   grandparent: $GPARENT_COMM" >&2
+    echo "   forcing approval gate. Use /swarm approve <batch-id> from Telegram." >&2
+    REQUIRE_APPROVAL="true"
+    bash "$SCRIPTS_DIR/notify.sh" --milestone fail \
+      "scope=$BATCH_ID" "reason=A claude subprocess attempted to bypass the approval gate — gate forced back on" \
+      2>/dev/null || true
+  fi
+fi
+
 if [ "$REQUIRE_APPROVAL" = "true" ]; then
   mkdir -p "$PENDING_DIR"
   cp "$TASKS_JSON" "$PENDING_DIR/tasks.json"
