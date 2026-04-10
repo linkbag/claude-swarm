@@ -35,7 +35,11 @@ bash "$SCRIPTS_DIR/notify.sh" --milestone plan \
 # /swarm approve <batch-id> will re-invoke this script with the env var unset
 # so the auto-endorse path runs.
 
-REQUIRE_APPROVAL="${SWARM_REQUIRE_APPROVAL:-false}"
+# Approval-first by default. Every entry path (bot, manual shell, MCP) writes
+# a pending dir and waits for /swarm approve <batch> unless the caller explicitly
+# opts out with SWARM_REQUIRE_APPROVAL=false. The bot's /swarm approve handler
+# does exactly that when it re-invokes us after the human says yes.
+REQUIRE_APPROVAL="${SWARM_REQUIRE_APPROVAL:-true}"
 PENDING_DIR="$SWARM_DIR/state/pending/$BATCH_ID"
 
 if [ "$REQUIRE_APPROVAL" = "true" ]; then
