@@ -143,12 +143,74 @@ if [ "$AGENT_STATUS" = "fail" ]; then
       *)      FALLBACK="$CUR_MODEL" ;;
     esac
 
+    # ─── Ralph Loop V2: failure analysis before retry ──────────────────────
+    # Try to refine the prompt with context from logs/worklog/diff/prior
+    # learnings. If the analyzer produces a refined prompt, use it for the
+    # retry. If it escalates, stop the retry budget early. If it crashes or
+    # can't decide, fall back to the original prompt (current behavior).
+
+    ROLE_FOR_RETRY=$(jq -r --arg id "$TASK_ID" '.[] | select(.id == $id) | .role // "builder"' \
+                     "$SWARM_DIR/state/active-tasks.json" 2>/dev/null || echo "builder")
+    ORIGINAL_PROMPT_FILE="$SWARM_DIR/logs/${TMUX_SESSION}-prompt.md"
+    PROMPT_FOR_RETRY="$ORIGINAL_PROMPT_FILE"
+    ANALYZER_VERDICT="fallback"
+
     bash "$SCRIPTS_DIR/notify.sh" --milestone fail \
-      "scope=$TASK_ID" "reason=Retry $NEW_COUNT/$MAX_RETRIES — falling back $CUR_MODEL→$FALLBACK" \
+      "scope=$TASK_ID" "reason=Failed (round $RETRY_COUNT). 🔍 Analyzing failure..." \
+      2>/dev/null || true
+
+    if [ -x "$SCRIPTS_DIR/analyze-failure.sh" ]; then
+      ANALYZER_OUT=$(bash "$SCRIPTS_DIR/analyze-failure.sh" \
+        "$TASK_ID" "$PROJECT_DIR" "$ORIGINAL_PROMPT_FILE" "$NEW_COUNT" "$WORK_DIR" 2>&1 || true)
+      ANALYZER_RC=$?
+      echo "$ANALYZER_OUT" | tail -20
+
+      case "$ANALYZER_RC" in
+        0)
+          # Analyzer produced a refined prompt
+          REFINED_PATH="/tmp/prompt-${TASK_ID}-r${NEW_COUNT}.md"
+          if [ -f "$REFINED_PATH" ]; then
+            PROMPT_FOR_RETRY="$REFINED_PATH"
+            ANALYZER_VERDICT="refined"
+            bash "$SCRIPTS_DIR/notify.sh" --milestone review_fix \
+              "task=$TASK_ID" "round=$NEW_COUNT" 2>/dev/null || true
+            bash "$SCRIPTS_DIR/notify.sh" \
+              "🔧 \`$TASK_ID\` retry $NEW_COUNT — analyzer produced refined prompt" \
+              2>/dev/null || true
+          fi
+          ;;
+        1)
+          # Analyzer says escalate to human — stop retrying
+          ANALYZER_VERDICT="escalated"
+          VERDICT_PATH="/tmp/analyzer-verdict-${TASK_ID}"
+          VERDICT_TEXT="(no verdict body)"
+          [ -f "$VERDICT_PATH" ] && VERDICT_TEXT=$(cat "$VERDICT_PATH")
+          bash "$SCRIPTS_DIR/notify.sh" --milestone fail \
+            "scope=$TASK_ID" "reason=Analyzer escalated — needs human review: ${VERDICT_TEXT:0:200}" \
+            2>/dev/null || true
+          bash "$SCRIPTS_DIR/log-decision.sh" "task:$TASK_ID" \
+            "Failure analyzer escalated to human" \
+            "$VERDICT_TEXT" "$PROJECT_DIR" 2>/dev/null || true
+          bash "$SCRIPTS_DIR/state-helper.sh" set-status "$TASK_ID" failed 2>/dev/null || true
+          bash "$SCRIPTS_DIR/notify.sh" --milestone agent_done \
+            "task=$TASK_ID" "project=$PROJECT_NAME" "status=fail" 2>/dev/null || true
+          bash "$SCRIPTS_DIR/state-helper.sh" remove "$TASK_ID" 2>/dev/null || true
+          tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+          exit 0
+          ;;
+        *)
+          # Analyzer crashed or couldn't parse — fall back silently
+          echo "[watcher] analyzer fallback (rc=$ANALYZER_RC)"
+          ;;
+      esac
+    fi
+
+    bash "$SCRIPTS_DIR/notify.sh" --milestone fail \
+      "scope=$TASK_ID" "reason=Retry $NEW_COUNT/$MAX_RETRIES ($ANALYZER_VERDICT) — falling back $CUR_MODEL→$FALLBACK" \
       2>/dev/null || true
     bash "$SCRIPTS_DIR/log-decision.sh" "task:$TASK_ID" \
-      "Retry with model fallback" \
-      "Round $NEW_COUNT/$MAX_RETRIES — switching from $CUR_MODEL to $FALLBACK" \
+      "Retry with model fallback ($ANALYZER_VERDICT)" \
+      "Round $NEW_COUNT/$MAX_RETRIES — switching from $CUR_MODEL to $FALLBACK; prompt source: $ANALYZER_VERDICT" \
       "$PROJECT_DIR" \
       2>/dev/null || true
 
@@ -156,9 +218,8 @@ if [ "$AGENT_STATUS" = "fail" ]; then
     tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
     bash "$SCRIPTS_DIR/state-helper.sh" remove "$TASK_ID"
     bash "$SCRIPTS_DIR/spawn-agent.sh" "$PROJECT_DIR" "$TASK_ID" \
-      "$SWARM_DIR/logs/${TMUX_SESSION}-prompt.md" \
-      "$(jq -r --arg id "$TASK_ID" '.[] | select(.id == $id) | .role // "builder"' \
-          "$SWARM_DIR/state/active-tasks.json" 2>/dev/null || echo "builder")" \
+      "$PROMPT_FOR_RETRY" \
+      "$ROLE_FOR_RETRY" \
       "$FALLBACK" "high" 2>&1 | tail -5 || true
     exit 0
   fi
@@ -361,6 +422,55 @@ fi
 
 cd "$WORK_DIR"
 git push origin "$BRANCH" --force-with-lease 2>/dev/null || git push origin "$BRANCH" 2>/dev/null || true
+
+# ─── Ralph Loop V2: log success pattern to learnings.jsonl ──────────────────
+# Records that this prompt structure + role + model combination shipped a
+# task. Future failure analyses can grep these for "what worked for similar
+# tasks" before proposing a refined retry.
+
+if [ "${LAST_VERDICT:-}" = "pass" ] && [ -x "$SCRIPTS_DIR/learnings-helper.sh" ]; then
+  PROMPT_FILE_FOR_HASH="$SWARM_DIR/logs/${TMUX_SESSION}-prompt.md"
+  PROMPT_SHA="(none)"
+  PROMPT_FIRST_LINE=""
+  if [ -f "$PROMPT_FILE_FOR_HASH" ]; then
+    PROMPT_SHA=$(sha1sum "$PROMPT_FILE_FOR_HASH" | cut -c1-12)
+    PROMPT_FIRST_LINE=$(head -1 "$PROMPT_FILE_FOR_HASH" 2>/dev/null | tr -d '\r' || echo "")
+  fi
+  ROLE_FOR_LOG=$(jq -r --arg id "$TASK_ID" '.[] | select(.id == $id) | .role // "builder"' \
+                  "$SWARM_DIR/state/active-tasks.json" 2>/dev/null || echo "builder")
+  MODEL_FOR_LOG=$(jq -r --arg id "$TASK_ID" '.[] | select(.id == $id) | .model // "sonnet"' \
+                   "$SWARM_DIR/state/active-tasks.json" 2>/dev/null || echo "sonnet")
+  RETRY_FOR_LOG=$(jq -r --arg id "$TASK_ID" '.[] | select(.id == $id) | .retry_count // 0' \
+                   "$SWARM_DIR/state/active-tasks.json" 2>/dev/null || echo 0)
+  SIG_FOR_LOG=$(bash "$SCRIPTS_DIR/learnings-helper.sh" signature "$PROMPT_FIRST_LINE")
+  REVIEW_ROUNDS_USED="${ROUND:-1}"
+
+  SUCCESS_ENTRY=$(jq -cn \
+    --arg ts "$(date -Iseconds)" \
+    --arg task "$TASK_ID" \
+    --arg project "$PROJECT_NAME" \
+    --arg role "$ROLE_FOR_LOG" \
+    --arg model "$MODEL_FOR_LOG" \
+    --argjson retry "$RETRY_FOR_LOG" \
+    --argjson rounds "$REVIEW_ROUNDS_USED" \
+    --arg prompt_sha "$PROMPT_SHA" \
+    --arg sig "$SIG_FOR_LOG" \
+    --arg first_line "${PROMPT_FIRST_LINE:0:200}" \
+    '{
+       kind: "success",
+       ts: $ts,
+       task_id: $task,
+       project: $project,
+       role: $role,
+       model: $model,
+       retry_count: $retry,
+       review_rounds: $rounds,
+       prompt_sha: $prompt_sha,
+       signature: $sig,
+       prompt_first_line: $first_line
+     }')
+  bash "$SCRIPTS_DIR/learnings-helper.sh" append-success "$SUCCESS_ENTRY" 2>/dev/null || true
+fi
 
 # ─── Mark done + prune ──────────────────────────────────────────────────────
 
