@@ -25,7 +25,21 @@
 set -euo pipefail
 
 SWARM_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Preserve any env-set overrides BEFORE sourcing the conf, so callers can do
+# `SWARM_NOTIFY=none bash notify.sh ...` for testing or one-off sends.
+# Precedence: env > swarm.conf > defaults.
+_env_NOTIFY="${SWARM_NOTIFY-}"
+_env_WEBHOOK="${SWARM_WEBHOOK_URL-}"
+_env_TG_TOKEN="${SWARM_TELEGRAM_BOT_TOKEN-}"
+_env_TG_CHAT="${SWARM_TELEGRAM_CHAT_ID-}"
+
 [ -f "$SWARM_DIR/config/swarm.conf" ] && source "$SWARM_DIR/config/swarm.conf"
+
+[ -n "$_env_NOTIFY" ]   && SWARM_NOTIFY="$_env_NOTIFY"
+[ -n "$_env_WEBHOOK" ]  && SWARM_WEBHOOK_URL="$_env_WEBHOOK"
+[ -n "$_env_TG_TOKEN" ] && SWARM_TELEGRAM_BOT_TOKEN="$_env_TG_TOKEN"
+[ -n "$_env_TG_CHAT" ]  && SWARM_TELEGRAM_CHAT_ID="$_env_TG_CHAT"
 
 NOTIFY="${SWARM_NOTIFY:-none}"
 DEDUPE_FILE="/tmp/.swarm-notify-last"

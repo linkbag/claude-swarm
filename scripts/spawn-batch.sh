@@ -68,8 +68,10 @@ done
 bash "$SCRIPTS_DIR/notify.sh" --milestone spawn \
   "batch=$BATCH_ID" "count=$TASK_COUNT" "project=$PROJECT_NAME" 2>/dev/null || true
 
-# Clear any pending dir for this batch (in case this is a re-invocation after approval)
-rm -rf "$PENDING_DIR" 2>/dev/null || true
+# NOTE: pending dir cleanup is deferred to the very end of this script.
+# Doing it here would delete the tasks.json we're still iterating over when
+# the bot's /swarm approve re-invokes us with TASKS_JSON pointing inside the
+# pending dir.
 
 # Wait for cooldown
 sleep "${SWARM_ENDORSEMENT_COOLDOWN:-30}"
@@ -148,3 +150,7 @@ cat > "$SWARM_DIR/logs/batch-${BATCH_ID}.json" << EOF
 EOF
 
 echo "🧾 Batch metadata: $SWARM_DIR/logs/batch-${BATCH_ID}.json"
+
+# Now safe to clean the pending dir — every consumer of TASKS_JSON has run.
+# (For non-approval flow, PENDING_DIR doesn't exist so this is a no-op.)
+rm -rf "$PENDING_DIR" 2>/dev/null || true
