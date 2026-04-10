@@ -23,7 +23,11 @@ if [ ! -f "$TASKS_JSON" ]; then
 fi
 
 TASK_COUNT=$(jq length "$TASKS_JSON")
+PROJECT_NAME="$(basename "$PROJECT_DIR")"
 echo "🐝 Batch $BATCH_ID: spawning $TASK_COUNT subteams"
+
+bash "$SCRIPTS_DIR/notify.sh" --milestone plan \
+  "batch=$BATCH_ID" "count=$TASK_COUNT" "project=$PROJECT_NAME" 2>/dev/null || true
 
 # ─── Auto-endorse all tasks ──────────────────────────────────────────────────
 
@@ -32,6 +36,9 @@ for i in $(seq 0 $((TASK_COUNT - 1))); do
   TASK_ID=$(jq -r ".[$i].id" "$TASKS_JSON")
   bash "$SCRIPTS_DIR/endorse-task.sh" "$TASK_ID"
 done
+
+bash "$SCRIPTS_DIR/notify.sh" --milestone spawn \
+  "batch=$BATCH_ID" "count=$TASK_COUNT" "project=$PROJECT_NAME" 2>/dev/null || true
 
 # Wait for cooldown
 sleep "${SWARM_ENDORSEMENT_COOLDOWN:-30}"
@@ -63,13 +70,21 @@ fi
 # ─── Save batch metadata ────────────────────────────────────────────────────
 
 mkdir -p "$SWARM_DIR/logs"
+
+# Build sessions JSON array safely (printf '%s\n' with empty array still emits one line)
+if [ "${#TMUX_SESSIONS[@]}" -gt 0 ]; then
+  SESSIONS_JSON=$(printf '%s\n' "${TMUX_SESSIONS[@]}" | jq -R . | jq -s .)
+else
+  SESSIONS_JSON='[]'
+fi
+
 cat > "$SWARM_DIR/logs/batch-${BATCH_ID}.json" << EOF
 {
   "batchId": "$BATCH_ID",
   "projectDir": "$PROJECT_DIR",
   "description": "$BATCH_DESC",
   "createdAt": "$(date -Iseconds)",
-  "sessions": $(printf '%s\n' "${TMUX_SESSIONS[@]}" | jq -R . | jq -s .)
+  "sessions": $SESSIONS_JSON
 }
 EOF
 

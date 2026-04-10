@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
 # Claude Swarm — Check status of all running agents
-set -euo pipefail
+set -uo pipefail  # not -e: empty tmux ls / no matches must not abort the script
 
 echo "=== Active Swarm Agents ==="
-tmux ls 2>/dev/null | grep "^claude-" | while read -r line; do
+
+SESSIONS=$(tmux ls 2>/dev/null | grep "^claude-" || true)
+
+if [ -z "$SESSIONS" ]; then
+  echo "  (no active agents)"
+  exit 0
+fi
+
+while read -r line; do
+  [ -z "$line" ] && continue
   SESSION=$(echo "$line" | cut -d: -f1)
   TASK_ID="${SESSION#claude-}"
-  # Check if process is still running
   if tmux has-session -t "$SESSION" 2>/dev/null; then
-    LAST_LINE=$(tmux capture-pane -t "$SESSION" -p 2>/dev/null | grep -v "^$" | tail -1)
+    LAST_LINE=$(tmux capture-pane -t "$SESSION" -p 2>/dev/null | grep -v "^$" | tail -1 || echo "")
     if echo "$LAST_LINE" | grep -qi "done\|complete\|✅\|error\|❌"; then
       echo "  ✅ $TASK_ID — DONE"
     else
@@ -17,8 +25,4 @@ tmux ls 2>/dev/null | grep "^claude-" | while read -r line; do
   else
     echo "  ⚪ $TASK_ID — SESSION ENDED"
   fi
-done
-
-if ! tmux ls 2>/dev/null | grep -q "^claude-"; then
-  echo "  (no active agents)"
-fi
+done <<< "$SESSIONS"

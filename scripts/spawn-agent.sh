@@ -16,7 +16,6 @@ SCRIPTS_DIR="$SWARM_DIR/scripts"
 
 # Source config
 [ -f "$SWARM_DIR/config/swarm.conf" ] && source "$SWARM_DIR/config/swarm.conf"
-source "$SCRIPTS_DIR/_lib.sh" 2>/dev/null || true
 
 # ─── Parse arguments ─────────────────────────────────────────────────────────
 
@@ -228,3 +227,6 @@ echo "✅ Agent running in tmux session: $TMUX_SESSION"
 echo "   Work dir: $WORK_DIR"
 echo "   Branch: $BRANCH"
 echo "   Log: $SWARM_DIR/logs/$TMUX_SESSION.log"
+
+bash "$SCRIPTS_DIR/notify.sh" --milestone agent_start \
+  "task=$TASK_ID" "project=$PROJECT_NAME" "role=$ROLE" "model=$MODEL" 2>/dev/null || true

@@ -1,0 +1,13 @@
+# Local secrets — token, webhook URL, etc. live here. Use config/swarm.conf.example as a template.
+config/swarm.conf
+
+# Runtime state
+endorsements/
+state/
+logs/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp

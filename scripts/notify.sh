@@ -1,36 +1,191 @@
 #!/usr/bin/env bash
 # Claude Swarm — Send notification via webhook or telegram
-# Usage: notify.sh "message text"
+#
+# Two modes:
+#   1. Raw:        notify.sh "message text"
+#   2. Milestone:  notify.sh --milestone <type> [key=val ...]
+#
+# Milestone types (OpenClaw-style, formatted with emojis + structure):
+#   plan              key: batch, count, project
+#   spawn             key: batch, count, project
+#   agent_start       key: task, project, role, model
+#   agent_done        key: task, project, status (ok|fail)
+#   review_pass       key: task, round
+#   review_fix        key: task, round
+#   integration_start key: batch, branches
+#   integration_pass  key: batch, round
+#   integration_fail  key: batch, reason
+#   ship              key: batch, project
+#   fail              key: scope, reason
+#
+# Resilience:
+#   - 3 curl attempts with exponential backoff (1s, 3s, 9s)
+#   - Dedupe via SHA1 of last message in /tmp/.swarm-notify-last
+#   - All sends logged to logs/notifications.log
 set -euo pipefail
 
 SWARM_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 [ -f "$SWARM_DIR/config/swarm.conf" ] && source "$SWARM_DIR/config/swarm.conf"
 
-MSG="${1:?Usage: notify.sh <message>}"
 NOTIFY="${SWARM_NOTIFY:-none}"
-
-case "$NOTIFY" in
-  webhook)
-    if [ -n "${SWARM_WEBHOOK_URL:-}" ]; then
-      curl -s -X POST "$SWARM_WEBHOOK_URL" \
-        -H "Content-Type: application/json" \
-        -d "{\"text\": \"$MSG\"}" 2>/dev/null || true
-    fi
-    ;;
-  telegram)
-    if [ -n "${SWARM_TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${SWARM_TELEGRAM_CHAT_ID:-}" ]; then
-      curl -s "https://api.telegram.org/bot${SWARM_TELEGRAM_BOT_TOKEN}/sendMessage" \
-        -d "chat_id=${SWARM_TELEGRAM_CHAT_ID}" \
-        -d "text=${MSG}" \
-        -d "parse_mode=Markdown" 2>/dev/null || true
-    fi
-    ;;
-  none|"")
-    # Log only
-    echo "[notify] $MSG"
-    ;;
-esac
-
-# Always log
+DEDUPE_FILE="/tmp/.swarm-notify-last"
+LOG_FILE="$SWARM_DIR/logs/notifications.log"
 mkdir -p "$SWARM_DIR/logs"
-echo "[$(date -Iseconds)] $MSG" >> "$SWARM_DIR/logs/notifications.log"
+
+# ─── Helpers ────────────────────────────────────────────────────────────────
+
+# Parse key=value args into associative array entries (echo'd as key|value)
+_parse_kv() {
+  for arg in "$@"; do
+    if [[ "$arg" == *=* ]]; then
+      printf '%s\n' "$arg"
+    fi
+  done
+}
+
+# Get value for a key from key=value args (default to empty)
+_kv_get() {
+  local key="$1"; shift
+  for arg in "$@"; do
+    if [[ "$arg" == "${key}="* ]]; then
+      printf '%s' "${arg#${key}=}"
+      return 0
+    fi
+  done
+  printf ''
+}
+
+# Render a milestone type into a formatted message
+_render_milestone() {
+  local type="$1"; shift
+  local batch task project role model count round status branches reason scope
+
+  batch=$(_kv_get batch "$@")
+  task=$(_kv_get task "$@")
+  project=$(_kv_get project "$@")
+  role=$(_kv_get role "$@")
+  model=$(_kv_get model "$@")
+  count=$(_kv_get count "$@")
+  round=$(_kv_get round "$@")
+  status=$(_kv_get status "$@")
+  branches=$(_kv_get branches "$@")
+  reason=$(_kv_get reason "$@")
+  scope=$(_kv_get scope "$@")
+
+  case "$type" in
+    plan)
+      printf '🎯 *Plan*  `%s`\n📦 %s · %s tasks queued' "${batch:-?}" "${project:-?}" "${count:-?}"
+      ;;
+    spawn)
+      printf '🚀 *Spawning batch*  `%s`\n📦 %s · %s subteams' "${batch:-?}" "${project:-?}" "${count:-?}"
+      ;;
+    agent_start)
+      printf '👷 *Agent started*  `%s`\n📦 %s · %s/%s' "${task:-?}" "${project:-?}" "${role:-builder}" "${model:-sonnet}"
+      ;;
+    agent_done)
+      if [ "$status" = "fail" ]; then
+        printf '❌ *Agent failed*  `%s`\n📦 %s' "${task:-?}" "${project:-?}"
+      else
+        printf '✨ *Agent complete*  `%s`\n📦 %s' "${task:-?}" "${project:-?}"
+      fi
+      ;;
+    review_pass)
+      printf '✅ *Review passed*  `%s` (round %s)' "${task:-?}" "${round:-1}"
+      ;;
+    review_fix)
+      printf '🔧 *Review fix*  `%s` (round %s)' "${task:-?}" "${round:-1}"
+      ;;
+    integration_start)
+      printf '🔗 *Integration starting*  `%s`\n🌿 Branches: %s' "${batch:-?}" "${branches:-?}"
+      ;;
+    integration_pass)
+      printf '✅ *Integration passed*  `%s` (round %s)' "${batch:-?}" "${round:-1}"
+      ;;
+    integration_fail)
+      printf '⚠️ *Integration issue*  `%s`\n%s' "${batch:-?}" "${reason:-unknown}"
+      ;;
+    ship)
+      printf '🚢 *Shipped*  `%s` → main\n📦 %s' "${batch:-?}" "${project:-?}"
+      ;;
+    fail)
+      printf '🛑 *Failure*  %s\n%s' "${scope:-swarm}" "${reason:-unknown}"
+      ;;
+    *)
+      printf '%s' "$type"
+      ;;
+  esac
+}
+
+# Send via the configured channel, with retry. Returns 0 on success.
+_send() {
+  local msg="$1"
+  local attempt
+  local delays=(1 3 9)
+
+  case "$NOTIFY" in
+    webhook)
+      [ -z "${SWARM_WEBHOOK_URL:-}" ] && return 0
+      for attempt in 0 1 2; do
+        if curl -fsS -X POST "$SWARM_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"text\": $(printf '%s' "$msg" | jq -Rs .)}" >/dev/null 2>&1; then
+          return 0
+        fi
+        sleep "${delays[$attempt]}"
+      done
+      return 1
+      ;;
+    telegram)
+      [ -z "${SWARM_TELEGRAM_BOT_TOKEN:-}" ] && return 0
+      [ -z "${SWARM_TELEGRAM_CHAT_ID:-}" ] && return 0
+      for attempt in 0 1 2; do
+        if curl -fsS "https://api.telegram.org/bot${SWARM_TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${SWARM_TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${msg}" \
+            --data-urlencode "parse_mode=Markdown" \
+            --data-urlencode "disable_web_page_preview=true" >/dev/null 2>&1; then
+          return 0
+        fi
+        sleep "${delays[$attempt]}"
+      done
+      return 1
+      ;;
+    none|"")
+      echo "[notify] $msg"
+      return 0
+      ;;
+  esac
+}
+
+# ─── Main ───────────────────────────────────────────────────────────────────
+
+if [ "${1:-}" = "--milestone" ]; then
+  shift
+  TYPE="${1:?Usage: notify.sh --milestone <type> [key=val ...]}"
+  shift
+  MSG="$(_render_milestone "$TYPE" "$@")"
+else
+  MSG="${1:?Usage: notify.sh <message>  |  notify.sh --milestone <type> [key=val ...]}"
+fi
+
+# Dedupe: skip if identical to last message within last 30s
+if command -v sha1sum &>/dev/null; then
+  HASH=$(printf '%s' "$MSG" | sha1sum | cut -d' ' -f1)
+  if [ -f "$DEDUPE_FILE" ]; then
+    LAST_HASH=$(head -1 "$DEDUPE_FILE" 2>/dev/null || echo "")
+    LAST_TS=$(sed -n '2p' "$DEDUPE_FILE" 2>/dev/null || echo "0")
+    NOW=$(date +%s)
+    if [ "$HASH" = "$LAST_HASH" ] && [ $((NOW - LAST_TS)) -lt 30 ]; then
+      echo "[$(date -Iseconds)] [dedupe] $MSG" >> "$LOG_FILE"
+      exit 0
+    fi
+  fi
+  printf '%s\n%s\n' "$HASH" "$(date +%s)" > "$DEDUPE_FILE"
+fi
+
+# Send (with retry). Always log, regardless of channel success.
+if _send "$MSG"; then
+  echo "[$(date -Iseconds)] $MSG" >> "$LOG_FILE"
+else
+  echo "[$(date -Iseconds)] [send-failed] $MSG" >> "$LOG_FILE"
+fi

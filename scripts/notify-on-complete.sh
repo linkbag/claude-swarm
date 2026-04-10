@@ -40,13 +40,23 @@ done
 # ─── Notify completion ──────────────────────────────────────────────────────
 
 PROJECT_NAME="$(basename "$PROJECT_DIR")"
-bash "$SCRIPTS_DIR/notify.sh" "✅ Agent $TASK_ID completed ($PROJECT_NAME)" 2>/dev/null || true
+
+# Detect ok/fail from runner exit marker
+LAST_LINES=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -20 2>/dev/null || echo "")
+if echo "$LAST_LINES" | grep -q "\[runner\] ❌"; then
+  AGENT_STATUS="fail"
+else
+  AGENT_STATUS="ok"
+fi
+bash "$SCRIPTS_DIR/notify.sh" --milestone agent_done \
+  "task=$TASK_ID" "project=$PROJECT_NAME" "status=$AGENT_STATUS" 2>/dev/null || true
 
 # ─── Auto-review ────────────────────────────────────────────────────────────
 
 for ROUND in $(seq 1 "$MAX_REVIEW_ROUNDS"); do
   echo "[watcher] 🔍 Review round $ROUND/$MAX_REVIEW_ROUNDS for $TASK_ID"
-  bash "$SCRIPTS_DIR/notify.sh" "🔍 Review round $ROUND/$MAX_REVIEW_ROUNDS for $TASK_ID" 2>/dev/null || true
+  bash "$SCRIPTS_DIR/notify.sh" --milestone review_fix \
+    "task=$TASK_ID" "round=$ROUND" 2>/dev/null || true
 
   REVIEW_OUTPUT=$(mktemp)
   cd "$WORK_DIR"
@@ -72,7 +82,8 @@ Do NOT modify files unrelated to this task's changes." 2>&1 | tee "$REVIEW_OUTPU
 
   if grep -qi "LGTM\|looks good\|no issues\|clean" "$REVIEW_OUTPUT"; then
     echo "[watcher] ✅ Review passed (round $ROUND)"
-    bash "$SCRIPTS_DIR/notify.sh" "✅ Review passed for $TASK_ID (round $ROUND)" 2>/dev/null || true
+    bash "$SCRIPTS_DIR/notify.sh" --milestone review_pass \
+      "task=$TASK_ID" "round=$ROUND" 2>/dev/null || true
     rm -f "$REVIEW_OUTPUT"
     break
   fi
@@ -85,5 +96,13 @@ done
 
 cd "$WORK_DIR"
 git push origin "$BRANCH" --force-with-lease 2>/dev/null || git push origin "$BRANCH" 2>/dev/null || true
+
+# ─── Prune active-tasks.json ────────────────────────────────────────────────
+
+TASKS_FILE="$SWARM_DIR/state/active-tasks.json"
+if [ -f "$TASKS_FILE" ] && command -v jq &>/dev/null; then
+  jq --arg id "$TASK_ID" '[.[] | select(.id != $id)]' "$TASKS_FILE" > "${TASKS_FILE}.tmp" \
+    && mv "${TASKS_FILE}.tmp" "$TASKS_FILE"
+fi
 
 echo "[watcher] Done with $TASK_ID"

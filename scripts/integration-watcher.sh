@@ -41,7 +41,9 @@ while true; do
   fi
 done
 
-bash "$SCRIPTS_DIR/notify.sh" "🔗 All subteams done for batch $BATCH_ID. Starting integration..." 2>/dev/null || true
+PROJECT_NAME="$(basename "$PROJECT_DIR")"
+bash "$SCRIPTS_DIR/notify.sh" --milestone integration_start \
+  "batch=$BATCH_ID" "branches=${SESSIONS[*]}" 2>/dev/null || true
 
 # ─── Collect branches ───────────────────────────────────────────────────────
 
@@ -120,7 +122,8 @@ If all good, say 'INTEGRATION PASSED'." 2>&1 | tee "$REVIEW"
 
   if grep -qi "INTEGRATION PASSED\|PASSED\|LGTM\|all good\|no issues" "$REVIEW"; then
     echo "[integration] ✅ Integration review passed (round $ROUND)"
-    bash "$SCRIPTS_DIR/notify.sh" "✅ Integration passed for batch $BATCH_ID (round $ROUND)" 2>/dev/null || true
+    bash "$SCRIPTS_DIR/notify.sh" --milestone integration_pass \
+      "batch=$BATCH_ID" "round=$ROUND" 2>/dev/null || true
     rm -f "$REVIEW"
     break
   fi
@@ -133,10 +136,12 @@ AUTO_MERGE="${SWARM_AUTO_MERGE:-true}"
 if [ "$AUTO_MERGE" = "true" ]; then
   git push origin main 2>/dev/null && {
     echo "[integration] ✅ Pushed to main"
-    bash "$SCRIPTS_DIR/notify.sh" "✅ Batch $BATCH_ID integrated and pushed to main" 2>/dev/null || true
+    bash "$SCRIPTS_DIR/notify.sh" --milestone ship \
+      "batch=$BATCH_ID" "project=$PROJECT_NAME" 2>/dev/null || true
   } || {
     echo "[integration] ❌ Push failed"
-    bash "$SCRIPTS_DIR/notify.sh" "❌ Batch $BATCH_ID integration push failed" 2>/dev/null || true
+    bash "$SCRIPTS_DIR/notify.sh" --milestone integration_fail \
+      "batch=$BATCH_ID" "reason=push to main failed" 2>/dev/null || true
   }
 else
   echo "[integration] Auto-merge disabled. Review and push manually."
@@ -146,5 +151,6 @@ fi
 
 if [ ${#MERGE_FAILURES[@]} -gt 0 ]; then
   echo "[integration] ⚠️ Failed to merge: ${MERGE_FAILURES[*]}"
-  bash "$SCRIPTS_DIR/notify.sh" "⚠️ Merge failures in batch $BATCH_ID: ${MERGE_FAILURES[*]}" 2>/dev/null || true
+  bash "$SCRIPTS_DIR/notify.sh" --milestone integration_fail \
+    "batch=$BATCH_ID" "reason=Merge failures: ${MERGE_FAILURES[*]}" 2>/dev/null || true
 fi
