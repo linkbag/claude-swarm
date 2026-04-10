@@ -45,11 +45,20 @@ PROJECT_NAME="$(basename "$PROJECT_DIR")"
 LAST_LINES=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -20 2>/dev/null || echo "")
 if echo "$LAST_LINES" | grep -q "\[runner\] ❌"; then
   AGENT_STATUS="fail"
+  bash "$SCRIPTS_DIR/state-helper.sh" set-status "$TASK_ID" failed 2>/dev/null || true
 else
   AGENT_STATUS="ok"
+  bash "$SCRIPTS_DIR/state-helper.sh" set-status "$TASK_ID" reviewing 2>/dev/null || true
 fi
 bash "$SCRIPTS_DIR/notify.sh" --milestone agent_done \
   "task=$TASK_ID" "project=$PROJECT_NAME" "status=$AGENT_STATUS" 2>/dev/null || true
+
+# Skip review if agent failed outright
+if [ "$AGENT_STATUS" = "fail" ]; then
+  bash "$SCRIPTS_DIR/state-helper.sh" remove "$TASK_ID" 2>/dev/null || true
+  echo "[watcher] Agent failed; skipping review."
+  exit 0
+fi
 
 # ─── Auto-review ────────────────────────────────────────────────────────────
 
@@ -97,12 +106,9 @@ done
 cd "$WORK_DIR"
 git push origin "$BRANCH" --force-with-lease 2>/dev/null || git push origin "$BRANCH" 2>/dev/null || true
 
-# ─── Prune active-tasks.json ────────────────────────────────────────────────
+# ─── Mark done + prune ──────────────────────────────────────────────────────
 
-TASKS_FILE="$SWARM_DIR/state/active-tasks.json"
-if [ -f "$TASKS_FILE" ] && command -v jq &>/dev/null; then
-  jq --arg id "$TASK_ID" '[.[] | select(.id != $id)]' "$TASKS_FILE" > "${TASKS_FILE}.tmp" \
-    && mv "${TASKS_FILE}.tmp" "$TASKS_FILE"
-fi
+bash "$SCRIPTS_DIR/state-helper.sh" set-status "$TASK_ID" done 2>/dev/null || true
+bash "$SCRIPTS_DIR/state-helper.sh" remove "$TASK_ID" 2>/dev/null || true
 
 echo "[watcher] Done with $TASK_ID"

@@ -214,13 +214,12 @@ if [ -f "$SCRIPTS_DIR/notify-on-complete.sh" ]; then
   echo "👁️ Watcher PID: $WATCHER_PID (polls every 60s, auto-notifies on completion)"
 fi
 
-# ─── Register task ──────────────────────────────────────────────────────────
+# ─── Register task in state machine ─────────────────────────────────────────
 
-TASKS_FILE="$SWARM_DIR/state/active-tasks.json"
-mkdir -p "$SWARM_DIR/state"
 if command -v jq &>/dev/null; then
-  [ -f "$TASKS_FILE" ] || echo '[]' > "$TASKS_FILE"
-  jq ". + [{\"id\": \"$TASK_ID\", \"tmux\": \"$TMUX_SESSION\", \"branch\": \"$BRANCH\", \"role\": \"$ROLE\", \"model\": \"$MODEL\", \"project\": \"$PROJECT_NAME\", \"started\": \"$(date -Iseconds)\"}]" "$TASKS_FILE" > "${TASKS_FILE}.tmp" && mv "${TASKS_FILE}.tmp" "$TASKS_FILE"
+  bash "$SCRIPTS_DIR/state-helper.sh" add "$TASK_ID" \
+    "tmux=$TMUX_SESSION" "branch=$BRANCH" "role=$ROLE" \
+    "model=$MODEL" "project=$PROJECT_NAME" "effort=$EFFORT"
 fi
 
 echo "✅ Agent running in tmux session: $TMUX_SESSION"

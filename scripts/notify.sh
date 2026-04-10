@@ -107,6 +107,10 @@ _render_milestone() {
     ship)
       printf '🚢 *Shipped*  `%s` → main\n📦 %s' "${batch:-?}" "${project:-?}"
       ;;
+    endorse_required)
+      printf '🛂 *Approval needed*  `%s`\n📦 %s · %s tasks pending\n\nApprove: `/swarm approve %s`\nReject:  `/swarm reject %s`' \
+        "${batch:-?}" "${project:-?}" "${count:-?}" "${batch:-?}" "${batch:-?}"
+      ;;
     fail)
       printf '🛑 *Failure*  %s\n%s' "${scope:-swarm}" "${reason:-unknown}"
       ;;
