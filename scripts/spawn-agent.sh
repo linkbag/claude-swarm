@@ -81,11 +81,18 @@ else
 fi
 
 WORKLOG="/tmp/worklog-${TMUX_SESSION}.md"
+STEERING_FILE="$SWARM_DIR/state/steering/${TASK_ID}.md"
+mkdir -p "$SWARM_DIR/state/steering"
 PROMPT="${PROMPT}
 
 ## 📝 WORK LOG — MANDATORY
 Maintain a work log at: ${WORKLOG}
 At the end, append a structured handoff with what changed, how to verify, known issues, and decisions made.
+
+## 🎯 STEERING — CHECK BEFORE EACH MAJOR OPERATION
+Before starting each significant phase of work, check if ${STEERING_FILE} exists.
+If it does, read it for new instructions or course corrections from the operator.
+After applying any guidance, append a brief note to your worklog describing what changed.
 
 ## ✅ WHEN DONE:
 1. Finalize your work log
@@ -227,5 +234,6 @@ echo "   Work dir: $WORK_DIR"
 echo "   Branch: $BRANCH"
 echo "   Log: $SWARM_DIR/logs/$TMUX_SESSION.log"
 
-bash "$SCRIPTS_DIR/notify.sh" --milestone agent_start \
+SWARM_NOTIFY_TASK_ID="$TASK_ID" \
+  bash "$SCRIPTS_DIR/notify.sh" --milestone agent_start \
   "task=$TASK_ID" "project=$PROJECT_NAME" "role=$ROLE" "model=$MODEL" 2>/dev/null || true

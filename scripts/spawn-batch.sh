@@ -51,9 +51,68 @@ if [ "$REQUIRE_APPROVAL" = "true" ]; then
   "taskCount": $TASK_COUNT
 }
 EOF
+
+  # Build human-readable plan preview (Tier 1 item E)
+  PLAN_FILE="$PENDING_DIR/plan.md"
+  {
+    printf '# Batch `%s` — Plan Preview\n\n' "$BATCH_ID"
+    echo "**Project:** $PROJECT_NAME"
+    echo "**Description:** $BATCH_DESC"
+    echo "**Task count:** $TASK_COUNT"
+    echo
+
+    TOTAL_PROMPT_CHARS=0
+    for i in $(seq 0 $((TASK_COUNT - 1))); do
+      T_ID=$(jq -r ".[$i].id" "$TASKS_JSON")
+      T_DESC=$(jq -r ".[$i].description" "$TASKS_JSON")
+      T_ROLE=$(jq -r ".[$i].role // \"builder\"" "$TASKS_JSON")
+      T_MODEL=$(jq -r ".[$i].model // \"sonnet\"" "$TASKS_JSON")
+
+      printf '## %s. `%s`\n' "$((i + 1))" "$T_ID"
+      echo "- Role: \`$T_ROLE\`"
+      echo "- Model: \`$T_MODEL\`"
+
+      if [ -f "$T_DESC" ]; then
+        PROMPT_BODY=$(cat "$T_DESC")
+        PROMPT_CHARS=$(printf '%s' "$PROMPT_BODY" | wc -c)
+        TOTAL_PROMPT_CHARS=$((TOTAL_PROMPT_CHARS + PROMPT_CHARS))
+        echo "- Prompt size: $PROMPT_CHARS chars (~$((PROMPT_CHARS / 4)) tokens)"
+        echo "- Prompt preview:"
+        echo
+        echo '```'
+        printf '%s' "${PROMPT_BODY:0:600}"
+        [ "$PROMPT_CHARS" -gt 600 ] && printf '\n... (truncated)'
+        printf '\n```\n\n'
+      else
+        PROMPT_CHARS=$(printf '%s' "$T_DESC" | wc -c)
+        TOTAL_PROMPT_CHARS=$((TOTAL_PROMPT_CHARS + PROMPT_CHARS))
+        echo "- Inline prompt: $PROMPT_CHARS chars"
+        echo
+      fi
+    done
+
+    # Pre-flight estimate (Tier 3 item J): rough token + cost
+    EST_INPUT_TOKENS=$((TOTAL_PROMPT_CHARS / 4))
+    EST_OUTPUT_TOKENS=$((EST_INPUT_TOKENS * 3))
+    # Sonnet pricing approx: $3/M input, $15/M output
+    EST_COST_CENTS=$(( (EST_INPUT_TOKENS * 3 + EST_OUTPUT_TOKENS * 15) / 10000 ))
+
+    echo "---"
+    echo
+    echo "## Pre-flight estimate"
+    echo
+    echo "- Total prompt chars: $TOTAL_PROMPT_CHARS"
+    echo "- Estimated input tokens: ~$EST_INPUT_TOKENS"
+    echo "- Estimated output tokens: ~$EST_OUTPUT_TOKENS (3x heuristic)"
+    printf -- '- Estimated cost: ~$0.%02d (sonnet pricing, rough)\n' "$EST_COST_CENTS"
+    echo
+    echo "_Estimates are heuristic — historical batch averages improve them once batch-history.jsonl has data._"
+  } > "$PLAN_FILE"
+
   bash "$SCRIPTS_DIR/notify.sh" --milestone endorse_required \
     "batch=$BATCH_ID" "project=$PROJECT_NAME" "count=$TASK_COUNT" 2>/dev/null || true
   echo "🛂 Approval required — pending in $PENDING_DIR"
+  echo "   Plan: $PLAN_FILE"
   exit 0
 fi
 

@@ -76,19 +76,22 @@ _list_by_status() {
 
 # task_add <task-id> <k=v ...>
 # Required keys: tmux branch role model project. Sets status=running, started=now.
+# Optional: max_retries (default 2)
 _add_task() {
   local id="$1"; shift
-  local now tmux branch role model project effort
+  local now tmux branch role model project effort max_retries
   now=$(date -Iseconds)
+  max_retries="2"
 
   for kv in "$@"; do
     case "$kv" in
-      tmux=*)    tmux="${kv#tmux=}" ;;
-      branch=*)  branch="${kv#branch=}" ;;
-      role=*)    role="${kv#role=}" ;;
-      model=*)   model="${kv#model=}" ;;
-      project=*) project="${kv#project=}" ;;
-      effort=*)  effort="${kv#effort=}" ;;
+      tmux=*)        tmux="${kv#tmux=}" ;;
+      branch=*)      branch="${kv#branch=}" ;;
+      role=*)        role="${kv#role=}" ;;
+      model=*)       model="${kv#model=}" ;;
+      project=*)     project="${kv#project=}" ;;
+      effort=*)      effort="${kv#effort=}" ;;
+      max_retries=*) max_retries="${kv#max_retries=}" ;;
     esac
   done
 
@@ -97,12 +100,34 @@ _add_task() {
         id: $id, tmux: $tmux, branch: $branch, role: $role, model: $model,
         project: $project, effort: $effort, started: $now,
         status: "running", last_update: $now,
+        retry_count: 0, max_retries: ($max_retries | tonumber),
         history: [{at: $now, status: "running"}]
       }]' \
     --arg id "$id" --arg tmux "${tmux:-}" --arg branch "${branch:-}" \
     --arg role "${role:-builder}" --arg model "${model:-sonnet}" \
     --arg project "${project:-}" --arg effort "${effort:-high}" \
-    --arg now "$now"
+    --arg now "$now" --arg max_retries "$max_retries"
+}
+
+# task_increment_retry <task-id>
+_increment_retry() {
+  local id="$1"
+  local now
+  now=$(date -Iseconds)
+  _jq_inplace \
+    'map(if .id == $id then
+            .retry_count = ((.retry_count // 0) + 1)
+            | .last_update = $now
+            | .history = ((.history // []) + [{at: $now, status: ("retry-" + ((.retry_count // 0) | tostring))}])
+          else . end)' \
+    --arg id "$id" --arg now "$now"
+}
+
+# task_get_retry_info <task-id> → "<retry_count>:<max_retries>"
+_get_retry_info() {
+  jq -r --arg id "$1" \
+    '.[] | select(.id == $id) | "\((.retry_count // 0)):\((.max_retries // 2))"' \
+    "$TASKS_FILE"
 }
 
 # task_remove <task-id>
@@ -112,12 +137,14 @@ _remove_task() {
 }
 
 case "${1:-}" in
-  set-status)     shift; _with_lock _set_status "$@" ;;
-  get-status)     shift; _get_status "$@" ;;
+  set-status)      shift; _with_lock _set_status "$@" ;;
+  get-status)      shift; _get_status "$@" ;;
   count-by-status) shift; _count_by_status "$@" ;;
-  list-by-status) shift; _list_by_status "$@" ;;
-  add)            shift; _with_lock _add_task "$@" ;;
-  remove)         shift; _with_lock _remove_task "$@" ;;
+  list-by-status)  shift; _list_by_status "$@" ;;
+  add)             shift; _with_lock _add_task "$@" ;;
+  remove)          shift; _with_lock _remove_task "$@" ;;
+  increment-retry) shift; _with_lock _increment_retry "$@" ;;
+  get-retry-info)  shift; _get_retry_info "$@" ;;
   *)
     cat <<USAGE >&2
 Usage: state-helper.sh <command> [args...]
@@ -125,8 +152,10 @@ Usage: state-helper.sh <command> [args...]
   get-status <task-id>
   count-by-status <status>
   list-by-status <status>
-  add <task-id> tmux=... branch=... role=... model=... project=... [effort=...]
+  add <task-id> tmux=... branch=... role=... model=... project=... [effort=...] [max_retries=N]
   remove <task-id>
+  increment-retry <task-id>
+  get-retry-info <task-id>      → "<retry_count>:<max_retries>"
 
 Statuses: pending endorsed running reviewing done failed stuck
 USAGE

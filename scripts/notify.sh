@@ -157,13 +157,27 @@ _send() {
       [ -z "${SWARM_TELEGRAM_BOT_TOKEN:-}" ] && return 0
       [ -z "${SWARM_TELEGRAM_CHAT_ID:-}" ] && return 0
       for attempt in 0 1 2; do
-        if curl -fsS "https://api.telegram.org/bot${SWARM_TELEGRAM_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${SWARM_TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=${msg}" \
-            --data-urlencode "parse_mode=Markdown" \
-            --data-urlencode "disable_web_page_preview=true" >/dev/null 2>&1; then
+        # Capture the response so we can extract the message_id for threading.
+        local resp
+        resp=$(curl -fsS "https://api.telegram.org/bot${SWARM_TELEGRAM_BOT_TOKEN}/sendMessage" \
+          --data-urlencode "chat_id=${SWARM_TELEGRAM_CHAT_ID}" \
+          --data-urlencode "text=${msg}" \
+          --data-urlencode "parse_mode=Markdown" \
+          --data-urlencode "disable_web_page_preview=true" 2>/dev/null) && {
+          # Tier 3 M: record message_id → task_id mapping for /reply threading
+          if [ -n "${SWARM_NOTIFY_TASK_ID:-}" ] && command -v jq &>/dev/null; then
+            local mid
+            mid=$(echo "$resp" | jq -r '.result.message_id // empty' 2>/dev/null)
+            if [ -n "$mid" ]; then
+              local map_file="$SWARM_DIR/state/message-task-map.json"
+              [ -f "$map_file" ] || echo '{}' > "$map_file"
+              jq --arg mid "$mid" --arg tid "$SWARM_NOTIFY_TASK_ID" \
+                '. + {($mid): $tid}' "$map_file" \
+                > "${map_file}.tmp" && mv "${map_file}.tmp" "$map_file"
+            fi
+          fi
           return 0
-        fi
+        }
         sleep "${delays[$attempt]}"
       done
       return 1
