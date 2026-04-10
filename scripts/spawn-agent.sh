@@ -118,9 +118,13 @@ if [ -d "$PROJECT_DIR/.git" ]; then
     echo "   Worktree already exists, reusing..."
     cd "$WORKTREE_DIR"
   else
-    git worktree add "$WORKTREE_DIR" -b "$BRANCH" origin/main 2>/dev/null || {
+    BASE_REF="origin/main"
+    if ! git rev-parse origin/main &>/dev/null 2>&1; then
+      BASE_REF=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "master")
+    fi
+    git worktree add "$WORKTREE_DIR" -b "$BRANCH" "$BASE_REF" 2>/dev/null || {
       git branch -D "$BRANCH" 2>/dev/null || true
-      git worktree add "$WORKTREE_DIR" -b "$BRANCH" origin/main
+      git worktree add "$WORKTREE_DIR" -b "$BRANCH" "$BASE_REF"
     }
     cd "$WORKTREE_DIR"
   fi
