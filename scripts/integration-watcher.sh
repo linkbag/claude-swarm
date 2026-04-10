@@ -149,6 +149,40 @@ for BRANCH in "${BRANCHES[@]}"; do
 done
 
 # ─── Integration review ─────────────────────────────────────────────────────
+#
+# Item 2: Build a CONTEXT block from every subteam's worklog so the integration
+# reviewer knows what each builder changed, why, and what they flagged. This is
+# the OpenClaw "killer pattern" — integration review is dramatically smarter
+# when it can see each subteam's reasoning.
+
+WORKLOG_CONTEXT=""
+for SESSION in "${SESSIONS[@]}"; do
+  WL="/tmp/worklog-${SESSION}.md"
+  if [ -f "$WL" ]; then
+    TASK_ID="${SESSION#claude-}"
+    WORKLOG_CONTEXT="${WORKLOG_CONTEXT}
+
+========================================
+## Subteam: ${TASK_ID}
+========================================
+$(cat "$WL")"
+  fi
+done
+
+if [ -n "$WORKLOG_CONTEXT" ]; then
+  WORKLOG_CONTEXT="
+
+## CONTEXT — Subteam Work Logs
+
+The following work logs were written by each builder. They document exactly what
+each subteam changed, why, what decisions were made, and what they flagged as
+risky. Use them to focus your review on cross-team interactions instead of
+re-deriving each subteam's intent from the diff alone.
+$WORKLOG_CONTEXT
+
+---
+"
+fi
 
 for ROUND in $(seq 1 "$MAX_INTEGRATION_ROUNDS"); do
   echo "[integration] 🔍 Integration review round $ROUND/$MAX_INTEGRATION_ROUNDS"
@@ -158,18 +192,20 @@ for ROUND in $(seq 1 "$MAX_INTEGRATION_ROUNDS"); do
 
   claude --model opus --effort high --permission-mode bypassPermissions --print \
     "Integration review for batch $BATCH_ID.
-
+$WORKLOG_CONTEXT
 Changes merged from ${#BRANCHES[@]} branches:
 $DIFF_STAT
 
-Check for:
-1. Cross-branch conflicts or duplicate code
-2. API contract mismatches between subteams
-3. Import errors or missing dependencies
-4. Build/compile issues (run build command if applicable)
+Check for cross-subteam issues:
+1. Dependency conflicts — subteams importing/changing the same modules differently
+2. Duplicate code — parallel agents solving the same problem independently
+3. API contract breaks — one subteam changed an interface another depends on
+4. Shared state — incompatible changes to global state, singletons, event buses
+5. Import/build conflicts — conflicting type definitions, missing exports
+6. Config compatibility — manifest/build/env conflicts
 
 If issues found, fix them and commit with 'integration fix (round $ROUND)'.
-If all good, say 'INTEGRATION PASSED'." 2>&1 | tee "$REVIEW"
+End with one of: INTEGRATION PASSED | INTEGRATION FIXED | INTEGRATION UNRESOLVED" 2>&1 | tee "$REVIEW"
 
   if grep -qi "INTEGRATION PASSED\|PASSED\|LGTM\|all good\|no issues" "$REVIEW"; then
     echo "[integration] ✅ Integration review passed (round $ROUND)"
@@ -219,6 +255,13 @@ PRBODY
       echo "[integration] ✅ Opened PR: $PR_URL"
       bash "$SCRIPTS_DIR/notify.sh" --milestone ship \
         "batch=$BATCH_ID" "project=$PROJECT_NAME (PR opened)" 2>/dev/null || true
+      # Item 5: kick off CI watcher in background for the PR's head commit
+      PR_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "")
+      if [ -n "$PR_COMMIT" ] && [ -x "$SCRIPTS_DIR/deploy-notify.sh" ]; then
+        nohup bash "$SCRIPTS_DIR/deploy-notify.sh" "$PROJECT_DIR" "$PR_COMMIT" "$BATCH_ID" \
+          >> "$SWARM_DIR/logs/deploy-notify-${BATCH_ID}.log" 2>&1 &
+        disown 2>/dev/null || true
+      fi
     else
       echo "[integration] ❌ gh pr create failed: $PR_URL"
       bash "$SCRIPTS_DIR/notify.sh" --milestone integration_fail \
@@ -233,6 +276,13 @@ elif [ "$AUTO_MERGE" = "true" ]; then
     echo "[integration] ✅ Pushed to main"
     bash "$SCRIPTS_DIR/notify.sh" --milestone ship \
       "batch=$BATCH_ID" "project=$PROJECT_NAME" 2>/dev/null || true
+    # Item 5: kick off CI watcher in background for the just-pushed commit
+    MAIN_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "")
+    if [ -n "$MAIN_COMMIT" ] && [ -x "$SCRIPTS_DIR/deploy-notify.sh" ]; then
+      nohup bash "$SCRIPTS_DIR/deploy-notify.sh" "$PROJECT_DIR" "$MAIN_COMMIT" "$BATCH_ID" \
+        >> "$SWARM_DIR/logs/deploy-notify-${BATCH_ID}.log" 2>&1 &
+      disown 2>/dev/null || true
+    fi
   } || {
     echo "[integration] ❌ Push failed"
     bash "$SCRIPTS_DIR/notify.sh" --milestone integration_fail \
@@ -266,8 +316,10 @@ else
   FINAL_STATUS="shipped"
 fi
 
+# Per-project ESR (now writes to <project>/docs/ESR.md too)
 bash "$SCRIPTS_DIR/append-esr.sh" "$BATCH_ID" "$PROJECT_NAME" "$FINAL_STATUS" \
   "${#BRANCHES[@]}" "$BATCH_DURATION" "Branches: ${BRANCHES[*]:-none}" \
+  "$PROJECT_DIR" \
   2>/dev/null || true
 
 # Append to batch history (jsonl, one line per batch — used by metrics + bot)
@@ -289,3 +341,30 @@ echo "$HIST_LINE" >> "$HIST_FILE"
 # Aggregate worklogs (Tier 1 item C) before exiting
 [ -x "$SCRIPTS_DIR/aggregate-worklogs.sh" ] && \
   bash "$SCRIPTS_DIR/aggregate-worklogs.sh" "$BATCH_ID" "${SESSIONS[@]}" 2>/dev/null || true
+
+# ─── Item 1: Persist worklogs to project history + auto-commit docs/ ────────
+HISTORY_DIR="$PROJECT_DIR/docs/history"
+mkdir -p "$HISTORY_DIR" 2>/dev/null || true
+WORKLOGS_PERSISTED=0
+for SESSION in "${SESSIONS[@]}"; do
+  WL="/tmp/worklog-${SESSION}.md"
+  if [ -f "$WL" ]; then
+    DEST="$HISTORY_DIR/$(date +%Y-%m-%d)-${SESSION}.md"
+    cp "$WL" "$DEST" 2>/dev/null && WORKLOGS_PERSISTED=$((WORKLOGS_PERSISTED + 1))
+  fi
+done
+
+# Auto-commit docs/ (ESR + decisions + history) to the project repo if it's a git repo
+if [ -d "$PROJECT_DIR/.git" ]; then
+  (
+    cd "$PROJECT_DIR" || exit 0
+    git add docs/ESR.md docs/decisions/ docs/history/ 2>/dev/null || true
+    if ! git diff --cached --quiet 2>/dev/null; then
+      git -c user.name="claude-swarm" -c user.email="swarm@claude-swarm.local" \
+        commit -m "docs: auto-update ESR + persist worklog for $BATCH_ID" 2>/dev/null && {
+        git push 2>/dev/null || true
+        echo "[integration] 📝 Auto-committed docs/ for batch $BATCH_ID ($WORKLOGS_PERSISTED worklogs)"
+      }
+    fi
+  )
+fi

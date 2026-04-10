@@ -19,6 +19,59 @@ BRANCH="${5:?Missing branch}"
 MAX_REVIEW_ROUNDS="${SWARM_MAX_REVIEW_ROUNDS:-3}"
 POLL_INTERVAL=60
 
+# ─── Item 4: Stuck-pattern + functional-done detection ─────────────────────
+#
+# Stuck patterns mean the agent is sitting on an interactive prompt or auth
+# error and will never finish on its own — kill immediately.
+#
+# Functional-done means the agent's log file shows clear completion milestones
+# (PR opened, branch pushed, commit hash) AND has been idle for >10 min — the
+# agent is done but tmux is hanging on something we can't see. Auto-close.
+
+STUCK_PATTERNS=(
+  "Failed to login"
+  "API key must be set"
+  "Authentication required"
+  "Enter your API key"
+  "How would you like to authenticate"
+  "Press Enter to continue"
+  "Do you want to proceed"
+  "Permission denied"
+  "(y/n)"
+  "(Y/n)"
+  "Error: EACCES"
+)
+
+DONE_MILESTONE_RE="Work log finalized|PR (opened|created):|Branch pushed:|Pushed: .*feat/|Commit:[[:space:]]+[0-9a-f]{7,}|\[runner\] ✅"
+IDLE_DONE_THRESHOLD=600  # 10 minutes
+LOG_FILE="$SWARM_DIR/logs/${TMUX_SESSION}.log"
+
+_check_stuck() {
+  local lines="$1"
+  for pat in "${STUCK_PATTERNS[@]}"; do
+    if echo "$lines" | grep -qiF "$pat"; then
+      echo "$pat"
+      return 0
+    fi
+  done
+  return 1
+}
+
+_check_functional_done() {
+  [ -f "$LOG_FILE" ] || return 1
+  local now last_mod idle_s
+  now=$(date +%s)
+  last_mod=$(stat -c %Y "$LOG_FILE" 2>/dev/null || echo 0)
+  [ "$last_mod" -gt 0 ] || return 1
+  idle_s=$(( now - last_mod ))
+  if [ "$idle_s" -gt "$IDLE_DONE_THRESHOLD" ] && \
+     grep -Eq "$DONE_MILESTONE_RE" "$LOG_FILE" 2>/dev/null; then
+    echo "$idle_s"
+    return 0
+  fi
+  return 1
+}
+
 # ─── Poll for completion ────────────────────────────────────────────────────
 
 while true; do
@@ -29,11 +82,33 @@ while true; do
     break
   fi
 
-  # Check if agent finished (look for runner completion message)
-  LAST_LINES=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -20 2>/dev/null || echo "")
+  # Check for runner completion marker first
+  LAST_LINES=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -30 2>/dev/null || echo "")
   if echo "$LAST_LINES" | grep -q "\[runner\] ✅\|\[runner\] ❌"; then
     echo "[watcher] Agent completed"
     break
+  fi
+
+  # Stuck-pattern check (auth, prompts, permissions)
+  if STUCK_REASON=$(_check_stuck "$LAST_LINES"); then
+    echo "[watcher] ⚠️ Stuck pattern detected: $STUCK_REASON — killing $TMUX_SESSION"
+    bash "$SCRIPTS_DIR/notify.sh" --milestone fail \
+      "scope=$TASK_ID" "reason=Stuck on '$STUCK_REASON' — killed by watcher" \
+      2>/dev/null || true
+    bash "$SCRIPTS_DIR/state-helper.sh" set-status "$TASK_ID" stuck 2>/dev/null || true
+    tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+    bash "$SCRIPTS_DIR/state-helper.sh" remove "$TASK_ID" 2>/dev/null || true
+    exit 0
+  fi
+
+  # Functional-done check (log idle but milestones reached)
+  if IDLE_S=$(_check_functional_done); then
+    MINS=$((IDLE_S / 60))
+    echo "[watcher] ℹ️ Functional-done detected: idle ${MINS}m + milestones present — auto-closing"
+    bash "$SCRIPTS_DIR/notify.sh" "ℹ️ \`$TASK_ID\` functionally complete (idle ${MINS}m after milestones) — auto-closing" \
+      2>/dev/null || true
+    tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+    break  # fall through to normal completion path
   fi
 done
 
@@ -74,6 +149,7 @@ if [ "$AGENT_STATUS" = "fail" ]; then
     bash "$SCRIPTS_DIR/log-decision.sh" "task:$TASK_ID" \
       "Retry with model fallback" \
       "Round $NEW_COUNT/$MAX_RETRIES — switching from $CUR_MODEL to $FALLBACK" \
+      "$PROJECT_DIR" \
       2>/dev/null || true
 
     # Kill old tmux session and respawn (this script is the watcher; spawn a fresh one)
@@ -136,6 +212,12 @@ _run_reviewer() {
     prior_findings+="$(cat "$FINDINGS_FILE")"
   fi
 
+  # Item 3: Verdict-file pattern. The reviewer is told to write a JSON verdict
+  # to a known path. The watcher reads it deterministically. If missing, the
+  # watcher uses smart inference (commit/worklog/exit-code → verdict).
+  local verdict_file="/tmp/review-verdict-${TASK_ID}-${persona}-r${round}.json"
+  rm -f "$verdict_file"
+
   claude --model "$model" --effort "$effort" --permission-mode bypassPermissions --print \
     "$persona_prompt
 
@@ -149,10 +231,74 @@ For each issue you find:
 - If it's safe and confined to this task's changes, fix it and commit with message 'review fix ($persona r$round)'
 - If it requires changes outside the task scope or you're uncertain, write the issue under '## Unresolved' below
 
-End your response with one of:
-- LGTM (no issues found)
-- FIXED (issues found and fixed)
-- UNRESOLVED (issues remain — describe them)" 2>&1 | tee "$review_out"
+## MANDATORY: Write a verdict file before exiting
+
+Run this command exactly (replace the values with your actual findings):
+
+  echo '{\"pass\": true, \"summary\": \"YOUR ONE-LINE SUMMARY HERE\", \"issues_remaining\": \"\"}' > $verdict_file
+
+Use \"pass\": true if you have no concerns OR if you fixed every issue you found.
+Use \"pass\": false ONLY if real issues remain that you couldn't safely fix —
+in that case set \"issues_remaining\" to a description.
+
+Your final shell action MUST be writing this verdict file." 2>&1 | tee "$review_out" >/dev/null
+}
+
+# Compute the deterministic verdict path for a (task, persona, round) tuple
+_verdict_path_for() {
+  local persona="$1" round="$2"
+  echo "/tmp/review-verdict-${TASK_ID}-${persona}-r${round}.json"
+}
+
+# Read a verdict file (or infer from environment if missing).
+# Echoes "pass" or "unresolved".
+_read_verdict() {
+  local verdict_file="$1" review_out="$2" persona="$3" round="$4"
+  if [ -f "$verdict_file" ]; then
+    local pass
+    pass=$(jq -r '.pass // false' "$verdict_file" 2>/dev/null || echo "false")
+    if [ "$pass" = "true" ]; then
+      echo "pass"
+      return
+    fi
+    echo "unresolved"
+    return
+  fi
+
+  # No verdict file — smart inference (OpenClaw pattern)
+  # 1. New commit on this branch since the round started? → reviewer fixed something
+  local latest
+  latest=$(cd "$WORK_DIR" 2>/dev/null && git log --oneline -1 2>/dev/null | head -1 || echo "")
+  if echo "$latest" | grep -qiE "review (fix|pass)|fix.*round|clean|lgtm"; then
+    echo "[watcher] (inferred from commit: $latest) → pass"
+    echo "pass"
+    return
+  fi
+
+  # 2. Reviewer's stdout contains an explicit pass/fix marker?
+  if [ -f "$review_out" ] && grep -qiE "^LGTM|^FIXED|all good|no issues|looks good" "$review_out"; then
+    echo "[watcher] (inferred from output marker) → pass"
+    echo "pass"
+    return
+  fi
+
+  # 3. Findings file was updated (implies reviewer actually did the work)
+  if [ -s "$FINDINGS_FILE" ] && grep -q "Round $round — $persona" "$FINDINGS_FILE"; then
+    # Reviewer wrote findings but no commit and no marker — could be either way.
+    # If the findings contain "UNRESOLVED" treat as fail; else auto-pass clean exit.
+    if grep -qi "UNRESOLVED" "$FINDINGS_FILE"; then
+      echo "[watcher] (inferred: findings contain UNRESOLVED) → unresolved"
+      echo "unresolved"
+      return
+    fi
+    echo "[watcher] (inferred: clean review pass, no unresolved markers) → pass"
+    echo "pass"
+    return
+  fi
+
+  # 4. Default: auto-pass clean exit (don't block on missing verdict)
+  echo "[watcher] (no verdict file, no commit, no findings — auto-pass clean exit)"
+  echo "pass"
 }
 
 for ROUND in $(seq 1 "$MAX_REVIEW_ROUNDS"); do
@@ -170,12 +316,9 @@ for ROUND in $(seq 1 "$MAX_REVIEW_ROUNDS"); do
     _run_reviewer senior opus high "$ROUND" "$REVIEW_OUT"
     echo "## Round $ROUND — senior" >> "$FINDINGS_FILE"
     cat "$REVIEW_OUT" >> "$FINDINGS_FILE"
-    if grep -qiE "LGTM|FIXED|no issues|all good" "$REVIEW_OUT"; then
-      VERDICT="pass"
-    else
-      VERDICT="unresolved"
-    fi
-    rm -f "$REVIEW_OUT"
+    VERDICT_FILE=$(_verdict_path_for senior "$ROUND")
+    VERDICT=$(_read_verdict "$VERDICT_FILE" "$REVIEW_OUT" senior "$ROUND")
+    rm -f "$REVIEW_OUT" "$VERDICT_FILE"
   else
     # Round 1 / 2: pair of specialized reviewers
     PASS_COUNT=0
@@ -185,10 +328,10 @@ for ROUND in $(seq 1 "$MAX_REVIEW_ROUNDS"); do
       echo "## Round $ROUND — $PERSONA" >> "$FINDINGS_FILE"
       cat "$REVIEW_OUT" >> "$FINDINGS_FILE"
       echo "" >> "$FINDINGS_FILE"
-      if grep -qiE "LGTM|FIXED|no issues|all good" "$REVIEW_OUT"; then
-        PASS_COUNT=$((PASS_COUNT + 1))
-      fi
-      rm -f "$REVIEW_OUT"
+      VERDICT_FILE=$(_verdict_path_for "$PERSONA" "$ROUND")
+      P_VERDICT=$(_read_verdict "$VERDICT_FILE" "$REVIEW_OUT" "$PERSONA" "$ROUND")
+      [ "$P_VERDICT" = "pass" ] && PASS_COUNT=$((PASS_COUNT + 1))
+      rm -f "$REVIEW_OUT" "$VERDICT_FILE"
     done
     if [ "$PASS_COUNT" -eq 2 ]; then VERDICT="pass"; else VERDICT="unresolved"; fi
   fi
@@ -210,7 +353,8 @@ LAST_VERDICT="${VERDICT:-unresolved}"
 if [ "$LAST_VERDICT" != "pass" ]; then
   bash "$SCRIPTS_DIR/log-decision.sh" "task:$TASK_ID" \
     "Review did not converge after $MAX_REVIEW_ROUNDS rounds" \
-    "See $FINDINGS_FILE for the full reviewer transcript." 2>/dev/null || true
+    "See $FINDINGS_FILE for the full reviewer transcript." \
+    "$PROJECT_DIR" 2>/dev/null || true
 fi
 
 # ─── Push final state ───────────────────────────────────────────────────────
