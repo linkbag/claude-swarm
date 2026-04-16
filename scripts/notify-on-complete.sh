@@ -97,7 +97,7 @@ while true; do
       2>/dev/null || true
     bash "$SCRIPTS_DIR/state-helper.sh" set-status "$TASK_ID" stuck 2>/dev/null || true
     tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
-    bash "$SCRIPTS_DIR/state-helper.sh" remove "$TASK_ID" 2>/dev/null || true
+    # Keep task in active-tasks.json as "stuck" — pruned by cleanup.sh after retention period
     exit 0
   fi
 
@@ -194,7 +194,7 @@ if [ "$AGENT_STATUS" = "fail" ]; then
           bash "$SCRIPTS_DIR/state-helper.sh" set-status "$TASK_ID" failed 2>/dev/null || true
           bash "$SCRIPTS_DIR/notify.sh" --milestone agent_done \
             "task=$TASK_ID" "project=$PROJECT_NAME" "status=fail" 2>/dev/null || true
-          bash "$SCRIPTS_DIR/state-helper.sh" remove "$TASK_ID" 2>/dev/null || true
+          # Keep task in active-tasks.json as "failed" — pruned by cleanup.sh after retention period
           tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
           exit 0
           ;;
@@ -231,7 +231,7 @@ if [ "$AGENT_STATUS" = "fail" ]; then
     2>/dev/null || true
   bash "$SCRIPTS_DIR/notify.sh" --milestone agent_done \
     "task=$TASK_ID" "project=$PROJECT_NAME" "status=fail" 2>/dev/null || true
-  bash "$SCRIPTS_DIR/state-helper.sh" remove "$TASK_ID" 2>/dev/null || true
+  # Keep task in active-tasks.json as "failed" — pruned by cleanup.sh after retention period
   echo "[watcher] Agent failed permanently; budget exhausted."
   exit 0
 fi
@@ -472,9 +472,10 @@ if [ "${LAST_VERDICT:-}" = "pass" ] && [ -x "$SCRIPTS_DIR/learnings-helper.sh" ]
   bash "$SCRIPTS_DIR/learnings-helper.sh" append-success "$SUCCESS_ENTRY" 2>/dev/null || true
 fi
 
-# ─── Mark done + prune ──────────────────────────────────────────────────────
+# ─── Mark done ──────────────────────────────────────────────────────────────
+# Keep the task in active-tasks.json as "done" so /swarm shows it in Recent.
+# Cleanup.sh prunes terminal-state tasks older than SWARM_RETENTION_DAYS (default 7).
 
 bash "$SCRIPTS_DIR/state-helper.sh" set-status "$TASK_ID" done 2>/dev/null || true
-bash "$SCRIPTS_DIR/state-helper.sh" remove "$TASK_ID" 2>/dev/null || true
 
 echo "[watcher] Done with $TASK_ID"

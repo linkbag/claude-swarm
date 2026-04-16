@@ -136,6 +136,31 @@ _remove_task() {
   _jq_inplace 'map(select(.id != $id))' --arg id "$id"
 }
 
+# task_prune_old [days]  — remove terminal-state tasks older than N days (default 7)
+_prune_old() {
+  local days="${1:-7}"
+  local cutoff
+  cutoff=$(date -d "${days} days ago" -Iseconds 2>/dev/null \
+           || date -v-${days}d -Iseconds 2>/dev/null \
+           || echo "")
+  if [ -z "$cutoff" ]; then
+    echo "[state] prune: cannot compute cutoff date, skipping" >&2
+    return 0
+  fi
+  local before after
+  before=$(jq 'length' "$TASKS_FILE")
+  _jq_inplace \
+    'map(select(
+      (.status // "running") as $s |
+      ($s == "running" or $s == "pending" or $s == "endorsed" or $s == "reviewing")
+      or (.last_update // .started // "") > $cutoff
+    ))' \
+    --arg cutoff "$cutoff"
+  after=$(jq 'length' "$TASKS_FILE")
+  local removed=$(( before - after ))
+  echo "[state] pruned $removed task(s) older than ${days}d with terminal status"
+}
+
 case "${1:-}" in
   set-status)      shift; _with_lock _set_status "$@" ;;
   get-status)      shift; _get_status "$@" ;;
@@ -143,6 +168,7 @@ case "${1:-}" in
   list-by-status)  shift; _list_by_status "$@" ;;
   add)             shift; _with_lock _add_task "$@" ;;
   remove)          shift; _with_lock _remove_task "$@" ;;
+  prune-old)       shift; _with_lock _prune_old "$@" ;;
   increment-retry) shift; _with_lock _increment_retry "$@" ;;
   get-retry-info)  shift; _get_retry_info "$@" ;;
   *)
@@ -154,6 +180,7 @@ Usage: state-helper.sh <command> [args...]
   list-by-status <status>
   add <task-id> tmux=... branch=... role=... model=... project=... [effort=...] [max_retries=N]
   remove <task-id>
+  prune-old [days]              → remove terminal-state tasks older than N days (default 7)
   increment-retry <task-id>
   get-retry-info <task-id>      → "<retry_count>:<max_retries>"
 

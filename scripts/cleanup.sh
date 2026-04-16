@@ -42,4 +42,10 @@ if [ "$ALL" = "--all" ]; then
   done
 fi
 
+# Prune terminal-state tasks older than SWARM_RETENTION_DAYS (default 7)
+SWARM_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+RETENTION="${SWARM_RETENTION_DAYS:-7}"
+echo "Pruning task history older than ${RETENTION} days..."
+bash "$SWARM_DIR/scripts/state-helper.sh" prune-old "$RETENTION" 2>/dev/null || true
+
 echo "✅ Cleanup complete"
